@@ -2,6 +2,13 @@ from datetime import datetime
 import pandas as pd
 import requests
 import streamlit as st
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 from frontend.ui import api, select_property
 
 st.title("Units")

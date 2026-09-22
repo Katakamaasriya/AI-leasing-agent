@@ -86,7 +86,15 @@ That fallback can summarize lead needs, list properties and amenities, inspect
 units, calculate unit matches from fresh inventory, and list tours.
 
 For natural model-generated responses, create a new OpenAI API key and set it
-only in the backend terminal before starting FastAPI:
+in a local `.env` file or only in the backend terminal before starting FastAPI.
+Start by copying `.env.example` to `.env` and replace the placeholder locally:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+The `.env` file is ignored by Git. Its contents must never be pasted into chat
+or committed.
 
 ```powershell
 $env:OPENAI_API_KEY = "your-new-key"
@@ -139,7 +147,7 @@ $env:LEASING_API_URL = "https://your-api-host.example.com"
 | `POST` | `/integrations/inventory/sync` | Refresh PMS/listing inventory |
 | `POST` | `/leads/{id}/qualify` | Evaluate published objective criteria |
 | `POST` | `/calendar/check` | Check a tour slot |
-| `POST` | `/tours` | Schedule a tour and confirmation intent |
+| `POST` | `/tours` | Validate and schedule a future tour with confirmation intent |
 | `POST` | `/leads/{id}/handoff` | Queue a human follow-up |
 | `GET` | `/metrics` | Read operational metrics |
 

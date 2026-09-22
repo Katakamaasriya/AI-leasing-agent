@@ -1,14 +1,162 @@
 import os
 import re
+import json
+from typing import Optional, Dict, Any
+import logging
+from datetime import datetime
 
 import requests
+from dotenv import load_dotenv
 from sqlalchemy.orm import Session
+from openai import AzureOpenAI
 
 from .models import Conversation, ConversationMessage, Lead, LeadEvent, Property, Tour, Unit
-from .services import get_unit_availability, inventory_freshness, log_event
+from .services import get_unit_availability, inventory_freshness, log_event, qualify_lead, schedule_tour
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# Azure OpenAI Configuration
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o-mini")
+
+# Fallback to OpenAI if Azure not configured
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# Initialize Azure OpenAI client if configured
+azure_client: Optional[AzureOpenAI] = None
+if AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT:
+    try:
+        azure_client = AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT
+        )
+        logger.info("Azure OpenAI client initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Azure OpenAI client: {e}")
 
 
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+def _call_azure_openai(message: str, conversation_context: str, lead_needs: str, database_context: str) -> tuple[str, str]:
+    """Call Azure OpenAI API for AI responses with fallback to OpenAI."""
+    try:
+        if azure_client:
+            # Use Azure OpenAI
+            system_prompt = f"""You are a professional leasing assistant for a property management company. Your role is to help prospects find their perfect home while maintaining compliance and providing excellent customer service.
+
+INSTRUCTIONS:
+- Be conversational, friendly, and professional
+- Answer questions based ONLY on the provided property and inventory data
+- Never invent pricing, availability, or details not in the database
+- Apply qualification criteria objectively and consistently
+- Never make discriminatory statements or use protected class information
+- Always offer human handoff when prospects request it or ask complex questions
+- Keep responses concise but helpful
+- Ask one focused follow-up question when you need more information
+- Proactively suggest next steps (tours, applications, etc.)
+
+SAFETY GUARDRAILS:
+- Never quote pricing from stale inventory (check freshness timestamps)
+- If inventory is not fresh, explain why and offer human assistance
+- For accommodations, exceptions, complaints, or legal questions: "A leasing specialist should help with that"
+- Always maintain fair housing compliance
+
+DATABASE CONTEXT:
+{database_context}
+
+CONVERSATION HISTORY:
+{conversation_context}
+
+CURRENT LEAD NEEDS:
+{lead_needs}
+
+Respond to the prospect's message appropriately based on this context."""
+
+            response = azure_client.chat.completions.create(
+                model=AZURE_OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            reply = response.choices[0].message.content.strip()
+            provider = "azure_openai"
+            logger.info(f"Azure OpenAI response generated successfully")
+            return reply, provider
+            
+        elif OPENAI_API_KEY:
+            # Fallback to OpenAI
+            OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+            system_prompt = f"""You are a professional leasing assistant for a property management company. Your role is to help prospects find their perfect home while maintaining compliance and providing excellent customer service.
+
+INSTRUCTIONS:
+- Be conversational, friendly, and professional
+- Answer questions based ONLY on the provided property and inventory data
+- Never invent pricing, availability, or details not in the database
+- Apply qualification criteria objectively and consistently
+- Never make discriminatory statements or use protected class information
+- Always offer human handoff when prospects request it or ask complex questions
+- Keep responses concise but helpful
+- Ask one focused follow-up question when you need more information
+- Proactively suggest next steps (tours, applications, etc.)
+
+SAFETY GUARDRAILS:
+- Never quote pricing from stale inventory (check freshness timestamps)
+- If inventory is not fresh, explain why and offer human assistance
+- For accommodations, exceptions, complaints, or legal questions: "A leasing specialist should help with that"
+- Always maintain fair housing compliance
+
+DATABASE CONTEXT:
+{database_context}
+
+CONVERSATION HISTORY:
+{conversation_context}
+
+CURRENT LEAD NEEDS:
+{lead_needs}
+
+Respond to the prospect's message appropriately based on this context."""
+
+            response = requests.post(
+                OPENAI_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": message}
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 500
+                },
+                timeout=20
+            )
+            response.raise_for_status()
+            payload = response.json()
+            reply = payload["choices"][0]["message"]["content"].strip()
+            provider = "openai"
+            logger.info(f"OpenAI response generated successfully")
+            return reply, provider
+            
+        else:
+            logger.warning("No AI provider configured, using fallback")
+            return None, "fallback"
+            
+    except Exception as e:
+        logger.error(f"AI API call failed: {e}")
+        return None, "fallback"
 
 
 def _extract_needs(profile: dict, message: str) -> dict:
@@ -135,41 +283,98 @@ def _whole_database_context(db: Session):
 
 def _fallback_reply(property_, units, freshness, profile, message):
     text = message.lower()
-    if any(phrase in text for phrase in ("budget", "afford", "how much can i spend")) and any(
-        phrase in text for phrase in ("what", "which", "my", "mentioned", "tell")
+    
+    # Greeting and initial inquiry handling
+    if any(phrase in text for phrase in ("hi", "hello", "hey", "good morning", "good afternoon", "good evening")):
+        if not freshness["fresh"]:
+            return (
+                f"Hello! Thanks for your interest in {property_.name if property_ else 'our properties'}. "
+                "I'd be happy to help you find your new home. However, our live availability feed needs to be refreshed, "
+                "so I can't quote current pricing or availability. A leasing specialist can help you directly. "
+                "Or reply HUMAN to speak with someone right away."
+            )
+        if not units:
+            return (
+                f"Hello! Thanks for your interest in {property_.name if property_ else 'our properties'}. "
+                "Unfortunately, there are no available homes in our current listing feed. "
+                "A leasing specialist can discuss upcoming availability with you. "
+                "Or reply HUMAN to speak with someone right away."
+            )
+        return (
+            f"Hello! Thanks for your interest in {property_.name if property_ else 'our properties'}. "
+            "I'd be happy to help you find your new home. I can tell you about available units, pricing, amenities, "
+            "and help schedule a tour. What's most important to you in your new home?"
+        )
+    
+    # Budget-related questions
+    if any(phrase in text for phrase in ("budget", "afford", "how much can i spend", "price range")) and any(
+        phrase in text for phrase in ("what", "which", "my", "mentioned", "tell", "does", "want")
     ):
         budget = profile.get("budget_monthly")
-        return f"Your recorded monthly budget is ${budget:,.0f}." if budget else "You have not told me a monthly budget yet."
+        if budget:
+            return f"Your recorded monthly budget is ${budget:,.0f}. Let me find units within that range."
+        else:
+            return "What's your monthly budget? This will help me find the perfect home for you."
+    
+    # Amenity questions
     if "amenit" in text:
         amenities = profile.get("amenities", [])
-        return "You mentioned these amenities: " + (", ".join(amenities) if amenities else "none yet") + "."
+        if amenities:
+            return f"You mentioned these amenities: {', '.join(amenities)}. I'll look for homes with these features."
+        else:
+            return "What amenities are important to you? For example: gym, pool, parking, in-unit laundry, balcony, etc."
+    
+    # Bedroom/home size questions
     if any(phrase in text for phrase in ("bedroom", "home size", "how many beds")) and any(
-        phrase in text for phrase in ("what", "which", "my", "need")
+        phrase in text for phrase in ("what", "which", "my", "need", "how many", "does", "want")
     ):
         bedrooms = profile.get("bedrooms")
-        return f"You are looking for {bedrooms} bedroom." if bedrooms is not None else "You have not told me your preferred home size yet."
-    if any(phrase in text for phrase in ("where", "location", "located")):
+        if bedrooms is not None:
+            return f"You're looking for {'a studio' if bedrooms == 0 else f'{bedrooms} bedroom'} home. Perfect!"
+        else:
+            return "What size home are you looking for? Studio, 1, 2, 3, or 4 bedrooms?"
+    
+    # Location questions
+    if any(phrase in text for phrase in ("where", "location", "located", "area")):
         location = profile.get("preferred_location")
-        return f"Your recorded preferred location is {location}." if location else "You have not told me a preferred location yet."
-    if any(phrase in text for phrase in ("summary", "what do you know", "what did i tell")):
-        return "Here is the current lead-needs summary: " + _needs_summary(profile)
+        if location:
+            return f"Your preferred location is {location}. I'll focus on that area."
+        else:
+            return "What area or neighborhood are you most interested in?"
+    
+    # Summary questions
+    if any(phrase in text for phrase in ("summary", "what do you know", "what did i tell", "what have i said")):
+        summary = _needs_summary(profile)
+        if summary == "I have not recorded any specific housing needs yet.":
+            return "I haven't learned about your preferences yet. Tell me about your budget, desired home size, location, and any amenities you'd like."
+        return f"Here's what I know about your preferences: {summary}"
+    
+    # Stale inventory warning
     if not freshness["fresh"]:
         return (
-            "Thanks for reaching out. Our live availability feed needs to be refreshed, "
-            "so I will not quote pricing or availability. A leasing specialist can help you directly."
+            "Our live availability feed needs to be refreshed, so I can't quote current pricing or availability. "
+            "This is important because I want to make sure you get accurate information. "
+            "A leasing specialist can help you with the most up-to-date information. "
+            "Reply HUMAN to speak with someone right away."
         )
+    
+    # No units available
     if not units:
         return (
-            f"Thanks for your interest in {property_.name}. There are no available homes in the "
-            "current listing feed. A leasing specialist can discuss upcoming availability."
+            f"I don't see any available homes in our current listing feed for {property_.name if property_ else 'our properties'}. "
+            "This could mean they're all currently reserved. A leasing specialist can check for upcoming availability "
+            "or similar options. Reply HUMAN to connect with someone who can help."
         )
+    
+    # Show available units
     unit_list = "; ".join(
         f"{unit.unit_number} ({unit.beds} bed, ${unit.monthly_rent:,.0f}/month)"
         for unit in units
     )
     return (
-        f"Thanks for your interest in {property_.name}. Current live availability: {unit_list}. "
-        "Tell me your preferred move-in date and home size, or reply HUMAN for a leasing specialist."
+        f"Great question! Here's what's currently available at {property_.name if property_ else 'our properties'}: {unit_list}. "
+        "Which one interests you most? I can also help you schedule a tour to see it in person. "
+        "Just let me know your preferred date and time, or reply HUMAN to speak with a leasing specialist."
     )
 
 
@@ -186,14 +391,15 @@ def _portfolio_fallback(db: Session):
             matches.append(f"{property_.name} at {property_.address}: {unit_list}")
     if not matches:
         return (
-            "I can compare homes across the portfolio, but the live inventory feed needs to be refreshed "
-            "before I can quote pricing or availability. Tell me your budget, move-in date, home size, "
-            "and preferred location, or reply HUMAN for a specialist."
+            "I'd love to help you find the perfect home across our properties, but our live inventory feed needs to be refreshed "
+            "before I can quote current pricing or availability. This is important because I want to make sure you get accurate information. "
+            "Tell me about your budget, move-in date, home size, and preferred location, and I'll be ready to help once the feed is updated. "
+            "Or reply HUMAN to speak with a leasing specialist right away."
         )
     return (
-        "Here are the current live options across the portfolio: " + " | ".join(matches) +
-        ". Tell me your budget, move-in date, home size, and preferred location so I can narrow the match, "
-        "or reply HUMAN for a leasing specialist."
+        "Great! Here are the current live options across our properties: " + " | ".join(matches) +
+        ". Tell me about your budget, move-in date, home size, and preferred location so I can recommend the best match for you. "
+        "I can also help you schedule a tour to see any of these properties in person!"
     )
 
 
@@ -301,6 +507,56 @@ def _tour_reply(db: Session):
     return "Scheduled tours: " + "; ".join(lines) + "."
 
 
+def agent_chat(db: Session, lead: Lead, prompt: str) -> dict:
+    """Run a read-first leasing tool loop with explicit side-effect guardrails."""
+    units = get_unit_availability(db, lead.property_id) if lead.property_id else []
+    text = prompt.lower()
+    tool_context = f"The database contains {len(units)} available unit(s) for this lead's property."
+
+    # Qualification requires facts that are not safe to infer from conversational text.
+    if any(word in text for word in ("qualify", "qualification", "income requirement")):
+        return {
+            "reply": "Qualification uses published objective criteria only. Please use the Qualification page with verified monthly income, move-in date, and published pet-policy details; a leasing specialist reviews the result.",
+            "tool_context": tool_context,
+        }
+
+    # Tour scheduling - provide helpful guidance
+    if any(word in text for word in ("book a tour", "schedule a tour", "schedule tour", "tour", "visit", "see", "visit the", "come see")):
+        tours = db.query(Tour).filter(Tour.status == "scheduled").order_by(Tour.starts_at).limit(5).all()
+        if tours:
+            tour_info = "; ".join(
+                f"{tour.starts_at:%A, %b %d at %I:%M %p}" 
+                for tour in tours
+            )
+            return {
+                "reply": f"I'd be happy to help you schedule a tour! Currently scheduled tours include: {tour_info}. "
+                "To book your tour, please use the Tours page where you can select your preferred date and time. "
+                "I'll make sure your information is connected to the tour booking. Or reply HUMAN to speak with a leasing specialist directly.",
+                "tool_context": tool_context,
+            }
+        else:
+            return {
+                "reply": "I'd be happy to help you schedule a tour! Our touring hours are Monday through Saturday, 9 AM to 6 PM. "
+                "Please use the Tours page to select your preferred date and time, and I'll help connect it to your information. "
+                "Or reply HUMAN to speak with a leasing specialist directly.",
+                "tool_context": tool_context,
+            }
+
+    # Human handoff request
+    if any(word in text for word in ("human", "person", "agent", "specialist", "real person", "talk to someone")):
+        lead.human_requested = True
+        db.commit()
+        return {
+            "reply": "I'll connect you with a leasing specialist right away. They'll have access to all our conversation and your preferences. "
+            "Is there anything specific you'd like me to pass along to them?",
+            "tool_context": tool_context,
+        }
+
+    result = respond_to_lead(db, lead, prompt)
+    result["reply"] = f"{result['reply']}"
+    return result
+
+
 def _property_details_reply(db: Session, message: str):
     properties = db.query(Property).order_by(Property.name).all()
     if not properties:
@@ -347,26 +603,47 @@ def respond_to_lead(db: Session, lead: Lead, message: str):
     units = get_unit_availability(db, lead.property_id) if lead.property_id else []
     freshness = inventory_freshness(units)
     text = message.lower()
-    if "amenit" in text:
+    
+    # Enhanced conversation flow with proactive suggestions
+    if any(phrase in text for phrase in ("which property", "what property", "suits", "best match", "recommend", "what would you recommend")):
+        fallback = _match_reply(db, lead.needs_profile)
+        if lead.needs_profile and any(lead.needs_profile.values()):
+            fallback += " Would you like me to help you schedule a tour to see this property?"
+    elif "amenit" in text:
         fallback = _amenities_reply(db, lead.property_id, message)
+        fallback += " I can show you which units have these amenities. Would you like to see specific unit details?"
     elif any(phrase in text for phrase in ("which unit", "what unit", "suits me", "best match", "recommend")):
         fallback = _match_reply(db, lead.needs_profile)
+        if lead.needs_profile and any(lead.needs_profile.values()):
+            fallback += " I can help you schedule a tour to see this unit in person. When would you like to visit?"
     elif any(phrase in text for phrase in ("tour", "schedule", "calendar", "appointment")):
         fallback = _tour_reply(db)
+        fallback += " To book a specific time, let me know your preferred date and time, or use the Tours page for the full calendar."
     elif any(phrase in text for phrase in ("all leads", "recent leads", "lead list", "unit inventory", "show me units", "operations", "database", "whole project", "overview")):
         fallback = _operations_fallback(db, message)
     elif any(phrase in text for phrase in ("where is", "where are", "address", "located")):
         fallback = _portfolio_availability_reply(db)
+        fallback += " Would you like more details about any of these properties?"
     elif any(phrase in text for phrase in ("property details", "tell me about", "what is", "what are the properties", "what are properties", "list properties", "show properties")):
         fallback = _property_details_reply(db, message)
+        fallback += " Is there a specific property you'd like to know more about?"
     elif any(phrase in text for phrase in ("what properties", "what are properties", "which properties", "list properties", "show properties", "properties available", "available properties")):
         fallback = _portfolio_availability_reply(db)
+        fallback += " Tell me about your budget and preferences, and I can recommend the best fit for you."
     elif any(phrase in text for phrase in ("what does", "what do i need", "my needs", "my requirements")):
         fallback = "Here is the current lead-needs summary: " + _needs_summary(lead.needs_profile)
-        if not lead.needs_profile:
-            fallback += " Please share your budget, desired home size, move-in date, location, and amenities."
+        if not lead.needs_profile or not any(lead.needs_profile.values()):
+            fallback += " Please share your budget, desired home size, move-in date, location, and amenities so I can find the perfect home for you."
+        else:
+            missing_info = []
+            if not lead.needs_profile.get("budget_monthly"): missing_info.append("budget")
+            if lead.needs_profile.get("bedrooms") is None: missing_info.append("bedroom preference")
+            if not lead.needs_profile.get("preferred_location"): missing_info.append("location preference")
+            if missing_info:
+                fallback += f" To give you better recommendations, could you tell me about your {', '.join(missing_info)}?"
     else:
         fallback = _fallback_reply(property_, units, freshness, lead.needs_profile, message) if property_ else _portfolio_fallback(db)
+    
     conversation = db.query(Conversation).filter_by(lead_id=lead.id).order_by(Conversation.id.desc()).first()
     if not conversation:
         raise ValueError("Lead conversation not found")
@@ -379,39 +656,19 @@ def respond_to_lead(db: Session, lead: Lead, message: str):
     db.flush()
     history = db.query(ConversationMessage).filter_by(conversation_id=conversation.id).order_by(ConversationMessage.id).all()
     transcript = "\n".join(f"{item.direction}: {item.body}" for item in history[-12:])
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    reply = fallback
-    provider = "fallback"
-
-    if api_key:
-        instructions = (
-            "You are a leasing information assistant. Answer only from the supplied property and live "
-            "inventory context. Never invent or estimate pricing, availability, fees, policies, or tour "
-            "times. Apply no protected-class or demographic criteria and never approve or deny an applicant. "
-            "Do not provide legal advice. For accommodations, exceptions, complaints, uncertainty, or any "
-            "request outside this context, say a leasing specialist should help. Always offer HUMAN handoff. "
-            "Keep the response concise and friendly.\n\n"
-            "When comparing properties, recommend only homes whose inventory is marked fresh. "
-            "If no fresh match exists, explain that a specialist should follow up. Ask one focused "
-            "question when the lead has not provided enough preferences.\n\n"
-            f"Whole database snapshot (read-only):\n{_whole_database_context(db)}\n\n"
-            f"Conversation so far:\n{transcript}\n\n"
-            f"Current analyzed lead needs: {_needs_summary(lead.needs_profile)}"
-        )
-        try:
-            response = requests.post(
-                OPENAI_RESPONSES_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "instructions": instructions, "input": message},
-                timeout=20,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            reply = payload.get("output_text", "").strip() or fallback
-            provider = "openai" if reply != fallback else "fallback"
-        except (requests.RequestException, ValueError, AttributeError):
-            provider = "fallback"
+    
+    # Use new Azure OpenAI integration
+    database_context = _whole_database_context(db)
+    conversation_context = transcript
+    lead_needs = _needs_summary(lead.needs_profile)
+    
+    ai_reply, provider = _call_azure_openai(message, conversation_context, lead_needs, database_context)
+    
+    if ai_reply:
+        reply = ai_reply
+    else:
+        reply = fallback
+        provider = "fallback"
 
     db.add(ConversationMessage(
         conversation_id=conversation.id,

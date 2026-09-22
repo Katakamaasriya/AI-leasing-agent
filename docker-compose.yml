@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # FastAPI Backend
+  api:
+    build: .
+    container_name: leasing-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://leasing:leasing123@db:5432/leasing_db
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_MODEL=${AZURE_OPENAI_MODEL}
+      - MICROSOFT_TENANT_ID=${MICROSOFT_TENANT_ID}
+      - MICROSOFT_CLIENT_ID=${MICROSOFT_CLIENT_ID}
+      - MICROSOFT_CLIENT_SECRET=${MICROSOFT_CLIENT_SECRET}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM=${SMTP_FROM}
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./backend:/app/backend
+      - ./frontend:/app/frontend
+    restart: unless-stopped
+    networks:
+      - leasing-network
+
+  # Streamlit Frontend
+  frontend:
+    build: .
+    container_name: leasing-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - LEASING_API_URL=http://api:8000
+    command: streamlit run frontend/app.py --server.address=0.0.0.0 --server.port=8501
+    depends_on:
+      - api
+    volumes:
+      - ./frontend:/app/frontend
+    restart: unless-stopped
+    networks:
+      - leasing-network
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: leasing-db
+    environment:
+      - POSTGRES_USER=leasing
+      - POSTGRES_PASSWORD=leasing123
+      - POSTGRES_DB=leasing_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - leasing-network
+
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: leasing-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - leasing-network
+
+  # Nginx Reverse Proxy (for production)
+  nginx:
+    image: nginx:alpine
+    container_name: leasing-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - api
+      - frontend
+    restart: unless-stopped
+    networks:
+      - leasing-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  leasing-network:
+    driver: bridge

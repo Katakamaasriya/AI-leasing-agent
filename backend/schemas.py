@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class InquiryIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -23,11 +23,19 @@ class QualificationIn(BaseModel):
     unit_id: int
 
 class TourIn(BaseModel):
-    property_id: int
-    prospect_name: str
-    prospect_contact: str
+    property_id: int = Field(gt=0)
+    prospect_name: str = Field(min_length=1, max_length=120)
+    prospect_contact: str = Field(min_length=3, max_length=160)
     starts_at: datetime
-    lead_id: int | None = None
+    lead_id: int | None = Field(default=None, gt=0)
+
+    @field_validator("prospect_name", "prospect_contact")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Value cannot be blank")
+        return value
 
 class AvailabilityRequest(BaseModel):
     property_id: int
@@ -70,6 +78,10 @@ class HandoffIn(BaseModel):
 class AIRespondIn(BaseModel):
     lead_id: int
     message: str = Field(min_length=1, max_length=2000)
+
+class AgentChatIn(BaseModel):
+    lead_id: int = Field(gt=0)
+    prompt: str = Field(min_length=1, max_length=2000)
 
 class PropertyCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)

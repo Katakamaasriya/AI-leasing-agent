@@ -3,16 +3,20 @@ import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
-from .ai import respond_to_lead
+from .ai import agent_chat, respond_to_lead
 from .database import Base, SessionLocal, engine, get_db
 from .models import Lead, LeadEvent, Property, Tour, Unit
 from .schemas import (AvailabilityRequest, HandoffIn, InquiryIn, InventorySyncIn, QualificationIn,
-                      TourIn, UnitCreateIn, UnitUpdateIn, PropertyCreateIn, AIRespondIn)
+                      TourIn, UnitCreateIn, UnitUpdateIn, PropertyCreateIn, AIRespondIn, AgentChatIn)
 from .services import (check_calendar_availability, get_pricing_and_amenities, get_unit_availability,
                        ingest_normalized_inquiry, inventory_freshness, qualify_lead, request_handoff,
                        schedule_tour, send_confirmation, sync_inventory)
+from .webhooks import router as webhook_router
 
-app = FastAPI(title="Leasing Concierge API", version="1.0.0")
+app = FastAPI(title="Leasing Concierge API", version="2.0.0")
+
+# Include webhook router for multi-channel intake
+app.include_router(webhook_router)
 
 @app.on_event("startup")
 def seed():
@@ -98,6 +102,14 @@ def ai_respond(data: AIRespondIn, db: Session = Depends(get_db)):
     lead = db.get(Lead, data.lead_id)
     if not lead: raise HTTPException(404, "Lead not found")
     return respond_to_lead(db, lead, data.message)
+@app.post("/agent/chat")
+def agent_chat_route(data: AgentChatIn, db: Session = Depends(get_db)):
+    lead = db.get(Lead, data.lead_id)
+    if not lead:
+        raise HTTPException(404, "Lead not found")
+    result = agent_chat(db, lead, data.prompt)
+    return {"reply": result["reply"], "needs_profile": lead.needs_profile or {},
+            "provider": result.get("provider", "database")}
 @app.post("/leads/{lead_id}/qualify")
 def qualify(lead_id: int, data: QualificationIn, db: Session = Depends(get_db)):
     lead, unit = db.get(Lead, lead_id), db.get(Unit, data.unit_id)
@@ -108,6 +120,17 @@ def qualify(lead_id: int, data: QualificationIn, db: Session = Depends(get_db)):
 def calendar_check(data: AvailabilityRequest, db: Session = Depends(get_db)): return check_calendar_availability(db, **data.model_dump())
 @app.post("/tours")
 def book_tour(data: TourIn, db: Session = Depends(get_db)):
+    property_ = db.get(Property, data.property_id)
+    if not property_:
+        raise HTTPException(404, "Property not found")
+    if data.starts_at <= datetime.utcnow():
+        raise HTTPException(422, "Tour time must be in the future")
+    if data.lead_id:
+        lead = db.get(Lead, data.lead_id)
+        if not lead:
+            raise HTTPException(404, "Lead not found")
+        if lead.property_id != data.property_id:
+            raise HTTPException(400, "Lead and property must match for tour scheduling")
     try: tour = schedule_tour(db, **data.model_dump())
     except ValueError as exc: raise HTTPException(409, str(exc))
     return {"tour": tour, "confirmation": send_confirmation(db, tour)}
